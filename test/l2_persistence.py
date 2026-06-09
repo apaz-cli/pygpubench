@@ -25,21 +25,38 @@ import ctypes
 import torch
 import pygpubench
 
-_dev = torch.cuda.current_device()
-_L2 = torch.cuda.get_device_properties(_dev).L2_cache_size
-_cudart = ctypes.CDLL("libcudart.so")
-
-# cudaDevAttrMaxPersistingL2CacheSize == 108; fall back to half of L2 if unavailable.
-_max_persist = _L2 // 2
-_v = ctypes.c_int(0)
-if _cudart.cudaDeviceGetAttribute(ctypes.byref(_v), 108, _dev) == 0 and _v.value > 0:
-    _max_persist = _v.value
-
-# Reused weight matrix sized to fit in the persisting carveout (cap 64 MiB).
-_W_BYTES = min(int(_max_persist * 0.75), 64 * 1024 * 1024)
 _M = 2048
-_K = max(1, _W_BYTES // (4 * _M))
-_W = torch.ones(_K, _M, device="cuda", dtype=torch.float32).contiguous()
+_state = None
+
+
+def _get_state():
+    global _state
+    if _state is not None:
+        return _state
+
+    dev = torch.cuda.current_device()
+    l2 = torch.cuda.get_device_properties(dev).L2_cache_size
+    cudart = ctypes.CDLL("libcudart.so")
+
+    # cudaDevAttrMaxPersistingL2CacheSize == 108; fall back to half of L2 if unavailable.
+    max_persist = l2 // 2
+    v = ctypes.c_int(0)
+    if cudart.cudaDeviceGetAttribute(ctypes.byref(v), 108, dev) == 0 and v.value > 0:
+        max_persist = v.value
+
+    # Reused weight matrix sized to fit in the persisting carveout (cap 64 MiB).
+    w_bytes = min(int(max_persist * 0.75), 64 * 1024 * 1024)
+    k = max(1, w_bytes // (4 * _M))
+    w = torch.ones(k, _M, device="cuda", dtype=torch.float32).contiguous()
+
+    _state = {
+        "cudart": cudart,
+        "l2": l2,
+        "max_persist": max_persist,
+        "k": k,
+        "w": w,
+    }
+    return _state
 
 
 class _AccessPolicyWindow(ctypes.Structure):
@@ -60,23 +77,26 @@ _installed = False
 
 def _install_persistence():
     """Pin _W in L2 by reserving a carveout and setting a persisting access-policy window."""
-    nbytes = _W.numel() * _W.element_size()
-    want = min(_max_persist, nbytes)
-    _cudart.cudaDeviceSetLimit(ctypes.c_int(_CUDA_LIMIT_PERSISTING_L2), ctypes.c_size_t(want))
+    state = _get_state()
+    w = state["w"]
+    cudart = state["cudart"]
+    nbytes = w.numel() * w.element_size()
+    want = min(state["max_persist"], nbytes)
+    cudart.cudaDeviceSetLimit(ctypes.c_int(_CUDA_LIMIT_PERSISTING_L2), ctypes.c_size_t(want))
     stream = torch.cuda.current_stream().cuda_stream
     val = _StreamAttrValue()
-    val.accessPolicyWindow.base_ptr = ctypes.c_void_p(_W.data_ptr())
+    val.accessPolicyWindow.base_ptr = ctypes.c_void_p(w.data_ptr())
     val.accessPolicyWindow.num_bytes = want
     val.accessPolicyWindow.hitRatio = 1.0
     val.accessPolicyWindow.hitProp = _CUDA_ACCESS_PROPERTY_PERSISTING
     val.accessPolicyWindow.missProp = _CUDA_ACCESS_PROPERTY_STREAMING
-    _cudart.cudaStreamSetAttribute(ctypes.c_void_p(stream),
-                                   ctypes.c_int(_CUDA_STREAM_ATTR_ACCESS_POLICY_WINDOW),
-                                   ctypes.byref(val))
+    cudart.cudaStreamSetAttribute(ctypes.c_void_p(stream),
+                                  ctypes.c_int(_CUDA_STREAM_ATTR_ACCESS_POLICY_WINDOW),
+                                  ctypes.byref(val))
 
 
 def kernel(output, x):
-    torch.mv(_W, x, out=output)
+    torch.mv(_get_state()["w"], x, out=output)
 
 
 def kernel_l2_persist(output, x):
@@ -84,15 +104,16 @@ def kernel_l2_persist(output, x):
     if not _installed:
         _install_persistence()
         _installed = True
-    torch.mv(_W, x, out=output)
+    torch.mv(_get_state()["w"], x, out=output)
 
 
 def generate_test_case(*, seed):
     gen = torch.Generator(device="cuda")
     gen.manual_seed(seed)
     x = torch.rand(_M, device="cuda", dtype=torch.float32, generator=gen).contiguous()
-    y = torch.empty(_K, device="cuda", dtype=torch.float32).contiguous()
-    expected = torch.mv(_W, x).contiguous()
+    w = _get_state()["w"]
+    y = torch.empty(w.shape[0], device="cuda", dtype=torch.float32).contiguous()
+    expected = torch.mv(w, x).contiguous()
     return (y, x), (expected, 1e-2, 1e-2)
 
 
@@ -105,9 +126,12 @@ def _bench(qualname, repeats=120, seed=1234):
 
 
 if __name__ == "__main__":
-    w_mib = _W.numel() * _W.element_size() / (1024 * 1024)
-    print(f"weights = {w_mib:.0f} MiB (K={_K} x M={_M}), "
-          f"max_persist = {_max_persist/1048576:.0f} MiB, L2 = {_L2/1048576:.0f} MiB")
+    state = _get_state()
+    w = state["w"]
+    w_mib = w.numel() * w.element_size() / (1024 * 1024)
+    print(f"weights = {w_mib:.0f} MiB (K={state['k']} x M={_M}), "
+          f"max_persist = {state['max_persist']/1048576:.0f} MiB, "
+          f"L2 = {state['l2']/1048576:.0f} MiB")
 
     honest = _bench("l2_persistence.kernel")
     hacked = _bench("l2_persistence.kernel_l2_persist")
