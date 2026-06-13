@@ -32,7 +32,8 @@ __all__ = [
 def _do_bench_impl(out_fd: "multiprocessing.connection.Connection", in_fd: "multiprocessing.connection.Connection", supervisor_sock: "socket.socket",
                    qualname: str, test_generator: TestGeneratorInterface,
                    test_args: dict, stream: int = None, discard: bool = True,
-                   nvtx: bool = False, tb_conn: "multiprocessing.connection.Connection" = None, landlock=True, mseal=True, allow_root=False):
+                   nvtx: bool = False, tb_conn: "multiprocessing.connection.Connection" = None, landlock=True, mseal=True, allow_root=False,
+                   writable_paths=("/tmp",)):
     """
     Benchmarks the kernel referred to by `qualname` against the test case returned by `test_generator`.
     :param out_fd: Writable file descriptor to which benchmark results are written.
@@ -46,6 +47,7 @@ def _do_bench_impl(out_fd: "multiprocessing.connection.Connection", in_fd: "mult
     :param landlock: Whether to enable landlock. Enabled by default, prevents write access to the file system outside /tmp.
     :param mseal: Whether to enable memory sealing. Enabled by default, prevents making executable mappings writable.
     :param allow_root: Whether to allow the benchmark to run as root (opt-in via ``allow_root=True``). When run as root, the benchmark process's memory can be read through /proc/self/mem despite being protected.
+    :param writable_paths: Filesystem paths (and everything beneath them) the benchmark is allowed to write to when landlock is enabled. Defaults to ``("/tmp",)``. ``/dev`` is always writable (needed by e.g. triton); the rest of the filesystem stays read-only.
     """
     if stream is None:
         import torch
@@ -66,6 +68,7 @@ def _do_bench_impl(out_fd: "multiprocessing.connection.Connection", in_fd: "mult
                 landlock,
                 mseal,
                 allow_root,
+                list(writable_paths),
             )
     except BaseException:
         if tb_conn is not None:
@@ -157,6 +160,7 @@ def do_bench_isolated(
         landlock = True,
         mseal = True,
         allow_root = False,
+        writable_paths = ("/tmp",),
 ) -> BenchmarkResult:
     """
     Runs kernel benchmark (`do_bench_impl`) in a subprocess for proper isolation.
@@ -204,6 +208,7 @@ def do_bench_isolated(
                 landlock,
                 mseal,
                 allow_root,
+                writable_paths,
             ),
         )
 
