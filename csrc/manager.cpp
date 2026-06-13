@@ -5,8 +5,10 @@
 #include "manager.h"
 #include "utils.h"
 #include "check.h"
+#include <algorithm>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <numeric>
 #include <optional>
 #include <system_error>
 #include <cstdlib>
@@ -27,7 +29,7 @@ static constexpr std::size_t ArenaSize = 2 * 1024 * 1024;
 static constexpr std::size_t BenchmarkManagerArenaSize = 128 * 1024 * 1024;
 
 extern void clear_cache(void* dummy_memory, int size, bool discard, cudaStream_t stream);
-extern void install_landlock();
+extern void install_landlock(const std::vector<std::string>& writable_paths);
 extern bool mseal_supported();
 extern void seal_mappings();
 extern bool supports_seccomp_notify();
@@ -139,7 +141,8 @@ void BenchmarkManagerDeleter::operator()(BenchmarkManager* p) const noexcept {
 
 BenchmarkManagerPtr make_benchmark_manager(
     int result_fd, const std::vector<char>& signature, std::uint64_t seed,
-    bool discard, bool nvtx, bool landlock, bool mseal, bool allow_root, int supervisor_socket)
+    bool discard, bool nvtx, bool landlock, bool mseal, bool allow_root, int supervisor_socket,
+    const std::vector<std::string>& writable_paths)
 {
     const std::size_t page_size = static_cast<std::size_t>(getpagesize());
     const std::size_t alloc_size = (BenchmarkManagerArenaSize + page_size - 1) & ~(page_size - 1);
@@ -155,7 +158,7 @@ BenchmarkManagerPtr make_benchmark_manager(
         raw = new (mem) BenchmarkManager(
             static_cast<std::byte*>(mem), alloc_size,
             result_fd, signature, seed,
-            discard, nvtx, landlock, mseal, allow_root, supervisor_socket);
+            discard, nvtx, landlock, mseal, allow_root, supervisor_socket, writable_paths);
     } catch (...) {
         // If construction throws, release the mmap'd region before propagating.
         if (munmap(mem, alloc_size) != 0) {
@@ -170,7 +173,8 @@ BenchmarkManagerPtr make_benchmark_manager(
 
 BenchmarkManager::BenchmarkManager(std::byte* arena, std::size_t arena_size,
                                    int result_fd, const std::vector<char>& signature, std::uint64_t seed, bool discard,
-                                   bool nvtx, bool landlock, bool mseal, bool allow_root, int supervisor_socket)
+                                   bool nvtx, bool landlock, bool mseal, bool allow_root, int supervisor_socket,
+                                   const std::vector<std::string>& writable_paths)
     : mArena(arena),
       mResource(arena + sizeof(BenchmarkManager),
           arena_size - sizeof(BenchmarkManager),
@@ -202,6 +206,7 @@ BenchmarkManager::BenchmarkManager(std::byte* arena, std::size_t arena_size,
 
     mNVTXEnabled = nvtx;
     mLandlock = landlock;
+    mWritablePaths = writable_paths;
     mSeal = mseal;
     mAllowRoot = allow_root;
     mDiscardCache = discard;
@@ -225,6 +230,8 @@ BenchmarkManager::~BenchmarkManager() {
     for (auto& exp: mExpectedOutputs) cudaFree(exp.Value);
 }
 
+static nb::tuple ensure_contiguous_tuple(const nb::tuple& tup);
+
 std::pair<std::vector<nb::tuple>, std::vector<nb::tuple>> BenchmarkManager::setup_benchmark(const nb::callable& generate_test_case, const nb::dict& kwargs, int repeats) {
     std::mt19937_64 rng(mSeed);
     std::uniform_int_distribution<std::uint64_t> dist(0, std::numeric_limits<std::uint64_t>::max());
@@ -244,14 +251,26 @@ std::pair<std::vector<nb::tuple>, std::vector<nb::tuple>> BenchmarkManager::setu
         call_kwargs["seed"] = dist(rng);
 
         auto gen = nb::cast<nb::tuple>(generate_test_case(**call_kwargs));
-        kernel_args[i] = nb::cast<nb::tuple>(gen[0]);
-        expected[i] = nb::cast<nb::tuple>(gen[1]);
+        kernel_args[i] = ensure_contiguous_tuple(nb::cast<nb::tuple>(gen[0]));
+        expected[i] = ensure_contiguous_tuple(nb::cast<nb::tuple>(gen[1]));
     }
     return std::make_pair(std::move(kernel_args), std::move(expected));
 }
 
 bool can_convert_to_tensor(nb::handle obj) {
-    return nb::isinstance<nb_cuda_array>(obj);
+    return nb::isinstance<nb_any_cuda_array>(obj);
+}
+
+static nb::tuple ensure_contiguous_tuple(const nb::tuple& tup) {
+    nb::list new_tup;
+    for (auto item : tup) {
+        if (nb::isinstance<nb_any_cuda_array>(item)) {
+            new_tup.append(nb::cast<nb::object>(item).attr("contiguous")());
+        } else {
+            new_tup.append(item);
+        }
+    }
+    return nb::tuple(new_tup);
 }
 
 auto BenchmarkManager::make_shadow_args(const nb::tuple& args, cudaStream_t stream,
@@ -332,7 +351,7 @@ void BenchmarkManager::install_protections() {
 
     // restrict access to file system
     if (mLandlock)
-        install_landlock();
+        install_landlock(mWritablePaths);
 
     if (mSeal) {
         if (!mseal_supported()) {
