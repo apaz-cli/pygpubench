@@ -230,8 +230,6 @@ BenchmarkManager::~BenchmarkManager() {
     for (auto& exp: mExpectedOutputs) cudaFree(exp.Value);
 }
 
-static nb::tuple ensure_contiguous_tuple(const nb::tuple& tup);
-
 std::pair<std::vector<nb::tuple>, std::vector<nb::tuple>> BenchmarkManager::setup_benchmark(const nb::callable& generate_test_case, const nb::dict& kwargs, int repeats) {
     std::mt19937_64 rng(mSeed);
     std::uniform_int_distribution<std::uint64_t> dist(0, std::numeric_limits<std::uint64_t>::max());
@@ -251,26 +249,14 @@ std::pair<std::vector<nb::tuple>, std::vector<nb::tuple>> BenchmarkManager::setu
         call_kwargs["seed"] = dist(rng);
 
         auto gen = nb::cast<nb::tuple>(generate_test_case(**call_kwargs));
-        kernel_args[i] = ensure_contiguous_tuple(nb::cast<nb::tuple>(gen[0]));
-        expected[i] = ensure_contiguous_tuple(nb::cast<nb::tuple>(gen[1]));
+        kernel_args[i] = nb::cast<nb::tuple>(gen[0]);
+        expected[i] = nb::cast<nb::tuple>(gen[1]);
     }
     return std::make_pair(std::move(kernel_args), std::move(expected));
 }
 
 bool can_convert_to_tensor(nb::handle obj) {
-    return nb::isinstance<nb_any_cuda_array>(obj);
-}
-
-static nb::tuple ensure_contiguous_tuple(const nb::tuple& tup) {
-    nb::list new_tup;
-    for (auto item : tup) {
-        if (nb::isinstance<nb_any_cuda_array>(item)) {
-            new_tup.append(nb::cast<nb::object>(item).attr("contiguous")());
-        } else {
-            new_tup.append(item);
-        }
-    }
-    return nb::tuple(new_tup);
+    return nb::isinstance<nb_cuda_array>(obj);
 }
 
 auto BenchmarkManager::make_shadow_args(const nb::tuple& args, cudaStream_t stream,
@@ -281,6 +267,14 @@ auto BenchmarkManager::make_shadow_args(const nb::tuple& args, cudaStream_t stre
     std::mt19937 gen(rd());
     std::uniform_int_distribution<unsigned> canary_seed_dist(0, 0xffffffff);
     for (int i = 1; i < nargs; i++) {
+        // A strided device array cannot be shadowed or canary-checked byte-wise. Silently
+        // skipping it would leave that argument unprotected, so refuse it instead; making
+        // test case tensors contiguous is done on the python side.
+        if (nb::isinstance<nb_any_cuda_array>(args[i]) && !can_convert_to_tensor(args[i])) {
+            throw std::runtime_error("kernel argument " + std::to_string(i) +
+                                     " is a non-contiguous CUDA array; test generators must produce contiguous tensors");
+        }
+
         if (can_convert_to_tensor(args[i])) {
             nb_cuda_array arr = nb::cast<nb_cuda_array>(args[i]);
             void* shadow;
